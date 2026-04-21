@@ -42,34 +42,32 @@ OUTPUT_CSV = os.path.join(DATA_DIR, 'douyin_data_with_topics.csv')
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-K_RANGE = range(4, 13)  # K = 4 ~ 12
+K_RANGE = range(4, 7)            # LDA 自动搜索话题数的范围 (4 ~ 8)
 MIN_TEXT_LENGTH = 5
 
 # ============================================================================
 # 分词函数（定义在顶层，供 CountVectorizer 的 tokenizer 引用）
 # ============================================================================
 import jieba
+import jieba.posseg as pseg
 import logging
 jieba.setLogLevel(logging.WARNING)  # 抑制 jieba 的 "Building prefix dict" 噪音日志
 
 # 添加 AI 领域自定义词汇 — 提高专业术语的分词准确性
 ai_custom_words = [
-    'deepseek', 'DeepSeek', 'chatgpt', 'ChatGPT', 'GPT', 'gpt',
-    'claude', 'Claude', 'gemini', 'Gemini', 'grok', 'Grok',
-    'token', 'Token', 'agent', 'Agent', 'LLM', 'llm',
-    'transformer', 'Transformer', 'MCP', 'mcp',
-    'AIGC', 'aigc', 'AGI', 'agi',
+    'deepseek', 'chatgpt', 'gpt', 'claude', 'gemini', 'grok',
+    'token', 'agent', 'llm', 'transformer', 'mcp', 'aigc', 'agi',
     '大模型', '大语言模型', '提示词', '智能体',
     '人工智能', '机器学习', '深度学习', '神经网络',
-    '生成式AI', '生成式', '注意力机制',
+    '生成式ai', '生成式', '注意力机制',
     '向量', '词元', '上下文', '上下文窗口',
     '豆包', '文心一言', '通义千问', '即梦',
-    '科大讯飞', '字节跳动', 'OpenAI', 'Anthropic',
+    '科大讯飞', '字节跳动', 'openai', 'anthropic',
     '开源模型', '闭源模型', '多模态',
     '人形机器人', '脑机接口', '自动驾驶',
     '斯皮尔伯格', '裘德洛', '奥斯卡',
     '数字人', '虚拟试穿', '语音合成',
-    '提示词工程', 'prompt', 'Prompt',
+    '提示词工程', 'prompt',
     '意见领袖', '信息茧房', '算力',
 ]
 for word in ai_custom_words:
@@ -81,23 +79,44 @@ with open(STOPWORDS_PATH, 'r', encoding='utf-8') as f:
 stopwords.update(['', ' ', '\n', '\r', '\t'])
 
 
+# 定义允许通过的词性白名单
+ALLOWED_POS = {
+    'n', 'nr', 'ns', 'nt', 'nz', 'nl', 'ng',  # 名词相关
+    'v', 'vn', 'vd',                          # 动词相关
+    'a', 'ad', 'an',                          # 形容词相关
+    'eng', 'l', 'i'                           # 英文、习用语、成语
+}
+
 def tokenize_and_filter(text):
     """
-    中文分词 + 停用词过滤 + 长度过滤
-    保留长度 >= 2 的有意义词汇（允许英文专业术语通过）
+    中文分词 + 词性过滤 + 停用词过滤 + 小写化
     """
-    words = jieba.cut(text, cut_all=False)
+    text = text.lower() # 强制转小写，解决 AI、Ai、ai 不统一问题
+    words = pseg.cut(text)
     filtered = []
-    for w in words:
-        w = w.strip()
+    
+    for word, flag in words:
+        w = word.strip()
+        
+        # 术语别名/缩写强制归一化 (基于全小写后的结果)
+        if w in ['ds', 'deep', 'deep seek']:
+            w = 'deepseek'
+            
+        # 1. 过滤停用词
         if w in stopwords:
             continue
+        # 2. 只有在允许的词性白名单中才保留 (拦截数词、代词、副词等)
+        if flag not in ALLOWED_POS:
+            continue
+        # 3. 长度和标点过滤
         if len(w) < 2 and not w.isascii():
             continue
-        if re.match(r'^[\d\s\W]+$', w) and not re.match(r'^[a-zA-Z]+$', w):
+        if re.match(r'^[\d\s\W]+$', w) and not re.match(r'^[a-z]+$', w):
             continue
-        if len(w) >= 2 or (w.isascii() and len(w) >= 2):
+        # 4. 保留2个字以上的中文，或者1个字母以上的英文
+        if len(w) >= 2 or (w.isascii() and len(w) >= 1 and w.isalpha()):
             filtered.append(w)
+            
     return filtered
 
 
