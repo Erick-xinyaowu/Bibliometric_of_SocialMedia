@@ -1,20 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
- 维度二：语义内容特征分析 — LDA 与 BERTopic 的对比检验
- 研究课题：注意力经济与信息扩散驱动的社交媒体演化机制研究
- 数据来源：抖音"生成式 AI"话题评论数据
+ 维度二：语义内容特征分析 — LDA 与 BERTopic 的对比检验及可视化重构
 =============================================================================
-
-科研意义：
-    本脚本通过对比传统概率模型 (LDA) 与深度学习语义模型 (BERTopic)，
-    探索社交媒体评论中吸引注意力的内容本质特征。
-    生成的话题标签将作为后续「注意力老化分析」和「演化关联分析」的关键变量。
-
-学术规范：
-    - 使用"检验聚类一致性"而非"验证模型正确性"
-    - 使用"拟合特征"而非"证明规律"
-    - 使用"呈现相关"而非"因果驱动"
 """
 
 import os
@@ -24,475 +12,315 @@ import numpy as np
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
-
-# ============================================================================
-# 全局配置
-# ============================================================================
-warnings.filterwarnings('ignore')
-matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
-matplotlib.rcParams['axes.unicode_minus'] = False
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, 'data')
-OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
-STOPWORDS_PATH = os.path.join(BASE_DIR, 'stopwords', 'chinese_stopwords.txt')
-
-INPUT_FILE = os.path.join(DATA_DIR, 'search_comments_2026-04-15_cleaned.csv')
-OUTPUT_CSV = os.path.join(DATA_DIR, 'douyin_data_with_topics.csv')
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-K_RANGE = range(4, 7)            # LDA 自动搜索话题数的范围 (4 ~ 8)
-MIN_TEXT_LENGTH = 5
-
-# ============================================================================
-# 分词函数（定义在顶层，供 CountVectorizer 的 tokenizer 引用）
-# ============================================================================
+import seaborn as sns
 import jieba
 import jieba.posseg as pseg
 import logging
-jieba.setLogLevel(logging.WARNING)  # 抑制 jieba 的 "Building prefix dict" 噪音日志
+from gensim import corpora, models
+from gensim.models import CoherenceModel
+from bertopic import BERTopic
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from umap import UMAP
+from hdbscan import HDBSCAN
 
-# 添加 AI 领域自定义词汇 — 提高专业术语的分词准确性
+# ============================================================================
+# 全局配置 & 科研配色体系
+# ============================================================================
+warnings.filterwarnings('ignore')
+sns.set_theme(style="whitegrid", context="paper")
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+# 使用维度一制定的学术莫兰迪色卡
+COLOR_PALETTE = ['#8EAAA4', '#D69882', '#7F6C92', '#89949D', '#C7C0C3', '#E1DFE2', '#B6B0B9', '#5E4D71', '#587E76', '#C05C3F']
+sns.set_palette(sns.color_palette(COLOR_PALETTE))
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+RESULTS_DIR = os.path.join(BASE_DIR, 'results', 'dimension2')
+STOPWORDS_PATH = os.path.join(BASE_DIR, 'stopwords', 'chinese_stopwords.txt')
+
+INPUT_FILE = os.path.join(DATA_DIR, 'search_comments_2026-04-15_cleaned.csv')
+OUTPUT_CSV = os.path.join(RESULTS_DIR, 'douyin_data_with_topics.csv')
+
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+K_RANGE = range(4, 7)            
+MIN_TEXT_LENGTH = 5
+
+# ============================================================================
+# 分词与预处理
+# ============================================================================
+jieba.setLogLevel(logging.WARNING)
 ai_custom_words = [
     'deepseek', 'chatgpt', 'gpt', 'claude', 'gemini', 'grok',
     'token', 'agent', 'llm', 'transformer', 'mcp', 'aigc', 'agi',
-    '大模型', '大语言模型', '提示词', '智能体',
-    '人工智能', '机器学习', '深度学习', '神经网络',
-    '生成式ai', '生成式', '注意力机制',
-    '向量', '词元', '上下文', '上下文窗口',
-    '豆包', '文心一言', '通义千问', '即梦',
+    '大模型', '大语言模型', '提示词', '智能体', '生成式ai',
+    '人工智能', '机器学习', '深度学习', '神经网络', '注意力机制',
+    '上下文', '豆包', '文心一言', '通义千问', '即梦',
     '科大讯飞', '字节跳动', 'openai', 'anthropic',
-    '开源模型', '闭源模型', '多模态',
-    '人形机器人', '脑机接口', '自动驾驶',
-    '斯皮尔伯格', '裘德洛', '奥斯卡',
-    '数字人', '虚拟试穿', '语音合成',
-    '提示词工程', 'prompt',
-    '意见领袖', '信息茧房', '算力',
+    '开源模型', '闭源模型', '多模态', '人形机器人', '脑机接口'
 ]
 for word in ai_custom_words:
     jieba.add_word(word)
 
-# 加载停用词
 with open(STOPWORDS_PATH, 'r', encoding='utf-8') as f:
     stopwords = set(line.strip() for line in f if line.strip())
-stopwords.update(['', ' ', '\n', '\r', '\t'])
+stopwords.update(['', ' ', '\n', '\r', '\t', '的', '了', '是', '我', '你', '在', '也', '就', '不', '有', '和'])
 
-
-# 定义允许通过的词性白名单
-ALLOWED_POS = {
-    'n', 'nr', 'ns', 'nt', 'nz', 'nl', 'ng',  # 名词相关
-    'v', 'vn', 'vd',                          # 动词相关
-    'a', 'ad', 'an',                          # 形容词相关
-    'eng', 'l', 'i'                           # 英文、习用语、成语
-}
+ALLOWED_POS = {'n', 'nr', 'ns', 'nt', 'nz', 'nl', 'ng', 'v', 'vn', 'vd', 'a', 'ad', 'an', 'eng', 'l', 'i'}
 
 def tokenize_and_filter(text):
-    """
-    中文分词 + 词性过滤 + 停用词过滤 + 小写化
-    """
-    text = text.lower() # 强制转小写，解决 AI、Ai、ai 不统一问题
+    text = text.lower()
     words = pseg.cut(text)
     filtered = []
-    
     for word, flag in words:
         w = word.strip()
-        
-        # 术语别名/缩写强制归一化 (基于全小写后的结果)
-        if w in ['ds', 'deep', 'deep seek']:
-            w = 'deepseek'
-            
-        # 1. 过滤停用词
-        if w in stopwords:
-            continue
-        # 2. 只有在允许的词性白名单中才保留 (拦截数词、代词、副词等)
-        if flag not in ALLOWED_POS:
-            continue
-        # 3. 长度和标点过滤
-        if len(w) < 2 and not w.isascii():
-            continue
-        if re.match(r'^[\d\s\W]+$', w) and not re.match(r'^[a-z]+$', w):
-            continue
-        # 4. 保留2个字以上的中文，或者1个字母以上的英文
+        if w in ['ds', 'deep', 'deep seek']: w = 'deepseek'
+        if w in stopwords or flag not in ALLOWED_POS: continue
+        if len(w) < 2 and not w.isascii(): continue
+        if re.match(r'^[\d\s\W]+$', w) and not re.match(r'^[a-z]+$', w): continue
         if len(w) >= 2 or (w.isascii() and len(w) >= 1 and w.isalpha()):
             filtered.append(w)
-            
     return filtered
 
-
 # ============================================================================
-# 主流程（Windows 兼容：包裹在 __main__ 保护块中）
+# 主流程
 # ============================================================================
 def main():
     print("=" * 70)
-    print("  维度二：语义内容特征分析 — LDA 与 BERTopic 对比检验")
+    print("  维度二：语义内容特征分析 — LDA 与 BERTopic 对比检验与静态重绘")
     print("=" * 70)
 
-    # ========================================================================
-    # 第一部分：数据预处理
-    # ========================================================================
-    print("\n" + "─" * 50)
-    print("📦 第一部分：数据预处理")
-    print("─" * 50)
-
-    print("\n[1.1] 读取评论数据...")
+    # ---------------- 1. 数据读取 ----------------
+    print("\n[1] 数据预处理...")
     df = pd.read_csv(INPUT_FILE)
-    print(f"  ✓ 原始数据：{len(df)} 条评论，涉及 {df['aweme_id'].nunique()} 条视频")
-
-    print(f"\n[1.2] 数据清洗：过滤空值及长度 ≤ {MIN_TEXT_LENGTH} 字符的评论...")
     df = df.dropna(subset=['content'])
     df['content'] = df['content'].astype(str)
-    df['text_length'] = df['content'].str.len()
-
-    short_count = (df['text_length'] <= MIN_TEXT_LENGTH).sum()
-    df_clean = df[df['text_length'] > MIN_TEXT_LENGTH].copy()
-    print(f"  ✓ 过滤超短评论 {short_count} 条")
-    print(f"  ✓ 保留有效评论 {len(df_clean)} 条 ({len(df_clean)/len(df)*100:.1f}%)")
-
-    print("\n[1.3] jieba 中文分词（含自定义 AI 领域词典）...")
-    print("  → 正在分词（可能需要 1~2 分钟）...")
+    df_clean = df[df['content'].str.len() > MIN_TEXT_LENGTH].copy()
+    
+    print("  → 正在分词...")
     df_clean['tokens'] = df_clean['content'].apply(tokenize_and_filter)
-    df_clean['tokens_str'] = df_clean['tokens'].apply(lambda x: ' '.join(x))
-
-    empty_tokens = (df_clean['tokens'].apply(len) == 0).sum()
     df_clean = df_clean[df_clean['tokens'].apply(len) > 0].copy()
-    print(f"  ✓ 分词完成，过滤空分词结果 {empty_tokens} 条")
-    print(f"  ✓ 最终有效文档数：{len(df_clean)} 条")
-
-    print("\n  📋 分词示例（前 3 条）：")
-    for i, row in df_clean.head(3).iterrows():
-        print(f"    原文: {row['content'][:60]}...")
-        print(f"    分词: {row['tokens'][:15]}")
-        print()
-
-    # ========================================================================
-    # 第二部分：LDA 主题建模
-    # 使用 LdaModel（单线程）以兼容 Windows multiprocessing 限制
-    # ========================================================================
-    print("\n" + "─" * 50)
-    print("📊 第二部分：LDA 主题建模")
-    print("─" * 50)
-
-    from gensim import corpora, models
-    from gensim.models import CoherenceModel
-
-    print("\n[2.1] 构建 gensim 词典与 BoW 语料库...")
     texts = df_clean['tokens'].tolist()
+    print(f"  ✓ 有效文档数：{len(df_clean)}")
+
+    # ---------------- 2. LDA 建模 ----------------
+    print("\n[2] LDA 建模与寻找最优 K...")
     dictionary = corpora.Dictionary(texts)
     dictionary.filter_extremes(no_below=5, no_above=0.5)
     corpus = [dictionary.doc2bow(text) for text in texts]
-    print(f"  ✓ 词典大小：{len(dictionary)} 个唯一词汇")
-    print(f"  ✓ 语料库大小：{len(corpus)} 篇文档")
-
-    print(f"\n[2.2] 搜索最优话题数 K（范围：{K_RANGE.start} ~ {K_RANGE.stop - 1}）...")
-    print("  → 这一步计算量较大，请耐心等待...")
 
     coherence_scores = []
     lda_models = {}
-
+    
+    # 限制 LDA 输出以防刷屏
     for k in K_RANGE:
-        # 使用 LdaModel 替代 LdaMulticore，避免 Windows spawn 问题
-        lda_model = models.LdaModel(
-            corpus=corpus,
-            id2word=dictionary,
-            num_topics=k,
-            random_state=42,
-            chunksize=100,
-            passes=10,
-            per_word_topics=True,
-            alpha='auto',
-            eta='auto'
-        )
-
-        coherence_model = CoherenceModel(
-            model=lda_model,
-            texts=texts,
-            dictionary=dictionary,
-            coherence='c_v',
-            processes=1  # 强制单进程，避免 Windows 子进程反复加载 jieba
-        )
-        score = coherence_model.get_coherence()
+        lda_model = models.LdaModel(corpus=corpus, id2word=dictionary, num_topics=k, random_state=42, passes=5)
+        cm = CoherenceModel(model=lda_model, texts=texts, dictionary=dictionary, coherence='c_v', processes=1)
+        score = cm.get_coherence()
         coherence_scores.append(score)
         lda_models[k] = lda_model
-        print(f"    K = {k:2d} → Coherence Score (c_v) = {score:.4f}")
-
-    # 2.3 绘制 Coherence Score 折线图
-    print("\n[2.3] 绘制 Coherence Score 折线图...")
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    k_values = list(K_RANGE)
-    ax.plot(k_values, coherence_scores, 'o-', color='#2563EB', linewidth=2, markersize=8)
+        print(f"    K={k:2d} → c_v={score:.4f}")
 
     best_idx = np.argmax(coherence_scores)
-    best_k = k_values[best_idx]
+    best_k = list(K_RANGE)[best_idx]
     best_score = coherence_scores[best_idx]
-    ax.axvline(x=best_k, color='#DC2626', linestyle='--', alpha=0.7, label=f'最优 K = {best_k}')
-    ax.scatter([best_k], [best_score], color='#DC2626', s=150, zorder=5, edgecolors='white', linewidth=2)
-    ax.annotate(f'K={best_k}\nc_v={best_score:.4f}',
-                xy=(best_k, best_score),
-                xytext=(best_k + 0.5, best_score + 0.01),
-                fontsize=11, fontweight='bold', color='#DC2626',
-                arrowprops=dict(arrowstyle='->', color='#DC2626'))
-
-    ax.set_xlabel('话题数 (K)', fontsize=13)
-    ax.set_ylabel('一致性得分 (Coherence Score, c_v)', fontsize=13)
-    ax.set_title('LDA 模型一致性得分随话题数 K 的变化', fontsize=15, fontweight='bold')
-    ax.set_xticks(k_values)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-
-    coherence_fig_path = os.path.join(OUTPUT_DIR, 'lda_coherence_scores.png')
-    fig.savefig(coherence_fig_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ 已保存：{coherence_fig_path}")
-
-    # 2.4 最优 K 输出
-    print(f"\n[2.4] 使用最优 K = {best_k} 的 LDA 模型输出话题关键词：")
     best_lda = lda_models[best_k]
 
-    print(f"\n  {'='*60}")
-    print(f"  LDA 最优模型结果（K = {best_k}，c_v = {best_score:.4f}）")
-    print(f"  {'='*60}")
+    # 图 1: LDA Coherence 折线图
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(list(K_RANGE), coherence_scores, 'o-', color='#D69882', linewidth=2.5, markersize=8)
+    ax.axvline(x=best_k, color='#89949D', linestyle='--', label=f'Best K = {best_k}')
+    ax.set_title('LDA 主题数 K 的 C_v 一致性得分演化', fontsize=14, fontweight='bold')
+    ax.set_xlabel('话题数 K')
+    ax.set_ylabel('C_v Score')
+    ax.legend()
+    plt.savefig(os.path.join(RESULTS_DIR, 'lda_coherence_scores.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
-    for topic_id in range(best_k):
-        words = best_lda.show_topic(topic_id, topn=10)
-        word_str = ' | '.join([f"{w}({p:.3f})" for w, p in words])
-        print(f"\n  话题 {topic_id}: {word_str}")
+    # 图 2: LDA Top Words 条形组图
+    cols = 2
+    rows = (best_k + 1) // 2
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 4 * rows))
+    axes = axes.flatten()
+    for i in range(len(axes)):
+        if i < best_k:
+            words_probs = best_lda.show_topic(i, topn=10)
+            words = [w[0] for w in words_probs]
+            probs = [w[1] for w in words_probs]
+            sns.barplot(x=probs, y=words, ax=axes[i], color=COLOR_PALETTE[i % len(COLOR_PALETTE)])
+            axes[i].set_title(f'LDA Topic {i}', fontweight='bold')
+            axes[i].set_xlabel('Probability')
+        else:
+            fig.delaxes(axes[i])
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, 'lda_top_words.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
-    # 2.5 pyLDAvis 可视化
-    print(f"\n[2.5] 生成 pyLDAvis 交互式可视化...")
-    try:
-        import pyLDAvis
-        import pyLDAvis.gensim_models as gensimvis
-
-        vis_data = gensimvis.prepare(best_lda, corpus, dictionary, sort_topics=False)
-        lda_vis_path = os.path.join(OUTPUT_DIR, 'lda_visualization.html')
-        pyLDAvis.save_html(vis_data, lda_vis_path)
-        print(f"  ✓ 已保存：{lda_vis_path}")
-    except Exception as e:
-        print(f"  ⚠ pyLDAvis 可视化生成失败：{e}")
-        print("  → 将跳过此步骤，不影响后续分析")
-
-    # ========================================================================
-    # 第三部分：BERTopic 主题建模
-    # ========================================================================
-    print("\n" + "─" * 50)
-    print("🤖 第三部分：BERTopic 主题建模")
-    print("─" * 50)
-
-    from bertopic import BERTopic
-    from sentence_transformers import SentenceTransformer
-    from sklearn.feature_extraction.text import CountVectorizer
-
-    print("\n[3.1] 加载多语言嵌入模型 paraphrase-multilingual-MiniLM-L12-v2...")
-    print("  → 首次运行需下载模型（约 420MB），后续使用缓存")
+    # ---------------- 3. BERTopic 建模 ----------------
+    print("\n[3] BERTopic 深度语义建模...")
     embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-    print("  ✓ 嵌入模型加载成功")
-
-    print("\n[3.2] 配置 BERTopic 模型...")
-
-    vectorizer_model = CountVectorizer(
-        tokenizer=tokenize_and_filter,
-        max_features=5000,
-        min_df=3,
-        max_df=0.5
-    )
-
-    from umap import UMAP
-    from hdbscan import HDBSCAN
-
-    umap_model = UMAP(
-        n_neighbors=15,
-        n_components=5,
-        min_dist=0.0,
-        metric='cosine',
-        random_state=42
-    )
-
-    hdbscan_model = HDBSCAN(
-        min_cluster_size=30,
-        min_samples=10,
-        metric='euclidean',
-        prediction_data=True
-    )
+    vectorizer_model = CountVectorizer(tokenizer=tokenize_and_filter, max_features=3000, min_df=3, max_df=0.5)
+    umap_model = UMAP(n_neighbors=15, n_components=5, min_dist=0.0, metric='cosine', random_state=42)
+    hdbscan_model = HDBSCAN(min_cluster_size=60, min_samples=15, metric='euclidean', prediction_data=True)
 
     topic_model = BERTopic(
         embedding_model=embedding_model,
         umap_model=umap_model,
         hdbscan_model=hdbscan_model,
         vectorizer_model=vectorizer_model,
-        calculate_probabilities=True,
-        verbose=True,
-        nr_topics='auto'
+        calculate_probabilities=False,
+        nr_topics=10
     )
-
-    print("\n[3.3] 拟合 BERTopic 模型（可能需要几分钟）...")
+    
     docs = df_clean['content'].tolist()
-    topics, probs = topic_model.fit_transform(docs)
-
-    print("\n[3.4] BERTopic 主题分布结果：")
+    topics, _ = topic_model.fit_transform(docs)
     topic_info = topic_model.get_topic_info()
     n_topics = len(topic_info) - (1 if -1 in topic_info['Topic'].values else 0)
-    print(f"\n  ✓ 共识别出 {n_topics} 个主题（不含离群点 Topic -1）")
+    print(f"  ✓ 成功识别 {n_topics} 个深度主题")
 
-    bertopic_outliers = topic_info[topic_info['Topic'] == -1]['Count'].values[0] if -1 in topic_info['Topic'].values else 0
-    print(f"  ✓ 离群点文档数：{bertopic_outliers}")
+    # [优化补充 1] 计算 BERTopic 的 C_v 一致性得分
+    topic_words_list = []
+    for t_id in topic_info['Topic']:
+        if t_id == -1: continue
+        top_words = [w for w, _ in topic_model.get_topic(t_id)]
+        topic_words_list.append(top_words)
+    
+    ber_cm = CoherenceModel(topics=topic_words_list, texts=texts, dictionary=dictionary, coherence='c_v', processes=1)
+    bertopic_cv_score = ber_cm.get_coherence()
+    print(f"  ✓ BERTopic 自动一致性得分(C_v): {bertopic_cv_score:.4f}")
 
-    print(f"\n  {'='*70}")
-    print(f"  BERTopic 主题分布")
-    print(f"  {'='*70}")
-    print(f"  {'Topic':>6} | {'Count':>6} | {'Name':<50}")
-    print(f"  {'─'*6}-+-{'─'*6}-+-{'─'*50}")
-    for _, row in topic_info.iterrows():
-        topic_id = row['Topic']
-        count = row['Count']
-        name = str(row.get('Name', ''))[:50]
-        print(f"  {topic_id:>6} | {count:>6} | {name}")
+    # 图 3: BERTopic Top Words Bar Chart
+    top_n = min(6, n_topics) # 画前6个话题
+    fig, axes = plt.subplots((top_n + 1)//2, 2, figsize=(14, 4 * ((top_n + 1)//2)))
+    axes = axes.flatten()
+    topic_idx = 0
+    for t_id in topic_info['Topic']:
+        if t_id == -1 or topic_idx >= top_n: continue
+        words_probs = topic_model.get_topic(t_id)
+        words = [w[0] for w in words_probs][:10]
+        probs = [w[1] for w in words_probs][:10]
+        sns.barplot(x=probs, y=words, ax=axes[topic_idx], color=COLOR_PALETTE[topic_idx % len(COLOR_PALETTE)])
+        # Label parsing
+        short_label = "_".join(words[:3])
+        axes[topic_idx].set_title(f'Cluster {t_id}: {short_label}', fontweight='bold')
+        axes[topic_idx].set_xlabel('c-TF-IDF Score')
+        topic_idx += 1
+        
+    for i in range(topic_idx, len(axes)): fig.delaxes(axes[i])
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, 'bertopic_barchart.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
-    print(f"\n  {'='*70}")
-    print(f"  各主题 Top-10 关键词")
-    print(f"  {'='*70}")
-    for topic_id in topic_info['Topic'].values:
-        if topic_id == -1:
-            continue
-        try:
-            topic_words = topic_model.get_topic(topic_id)
-            if topic_words:
-                words_str = ' | '.join([f"{w}({s:.3f})" for w, s in topic_words[:10]])
-                print(f"\n  话题 {topic_id}: {words_str}")
-        except Exception:
-            pass
+    # 图 4: 选项A - UMAP 降维散点图
+    print("  → 绘制 选项A: UMAP 降维散点图...")
+    # 使用专门用于可视化的 2D UMAP
+    umap_2d = UMAP(n_neighbors=15, n_components=2, min_dist=0.0, metric='cosine', random_state=42)
+    embeddings = embedding_model.encode(docs, show_progress_bar=False)
+    embeddings_2d = umap_2d.fit_transform(embeddings)
+    
+    plt.figure(figsize=(10, 8))
+    # Draw noise points first
+    noise_idx = np.array(topics) == -1
+    plt.scatter(embeddings_2d[noise_idx, 0], embeddings_2d[noise_idx, 1], color='#E1DFE2', s=5, alpha=0.3, label='Outliers (-1)')
+    # Draw valid clusters
+    for i, t_id in enumerate([t for t in topic_info['Topic'] if t != -1]):
+        t_idx = np.array(topics) == t_id
+        plt.scatter(embeddings_2d[t_idx, 0], embeddings_2d[t_idx, 1], s=15, alpha=0.8, color=COLOR_PALETTE[i % len(COLOR_PALETTE)], label=f'Topic {t_id}')
+    plt.title('UMAP 2D 降维语义聚类云图 (BERTopic)', fontsize=15, fontweight='bold')
+    plt.axis('off')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', markerscale=3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, 'bertopic_umap_scatter.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
-    # 3.5 BERTopic 可视化
-    print(f"\n[3.5] 生成 BERTopic 可视化图表...")
+    # 图 5: 选项B - 话题甜甜圈图
+    print("  → 绘制 选项B: 话题结构甜甜圈图...")
+    valid_topics = topic_info[topic_info['Topic'] != -1]
+    labels = ["_".join([w[0] for w in topic_model.get_topic(t_id)[:3]]) for t_id in valid_topics['Topic']]
+    sizes = valid_topics['Count']
+    
+    plt.figure(figsize=(10, 8))
+    wedges, texts, autotexts = plt.pie(sizes, autopct='%1.1f%%', startangle=90, pctdistance=0.85, 
+                                       colors=COLOR_PALETTE[:len(sizes)], wedgeprops=dict(width=0.35, edgecolor='w'))
+    plt.legend(wedges, labels, title="核心语义聚类簇", loc="center left", bbox_to_anchor=(1, 0, 0.5, 1))
+    plt.title('宏观信息生态：各核心话题占比分布 (Donut Chart)', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, 'bertopic_donut_chart.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
-    try:
-        fig_topics = topic_model.visualize_topics()
-        topics_vis_path = os.path.join(OUTPUT_DIR, 'bertopic_topics.html')
-        fig_topics.write_html(topics_vis_path)
-        print(f"  ✓ 主题距离图已保存：{topics_vis_path}")
-    except Exception as e:
-        print(f"  ⚠ 主题距离图生成失败：{e}")
+    # 图 6: 选项C - 语义相似度热力图
+    print("  → 绘制 选项C: 语义相似度热力图...")
+    # Get topic embeddings (the 0th one is usually outlier, but let's carefully extract)
+    valid_t_ids = [t for t in topic_info['Topic'] if t != -1]
+    # We must construct a matrix of embeddings for valid topics
+    t_embeds = []
+    t_labels = []
+    for t_id in valid_t_ids:
+        # bertopic saves embeddings internally
+        idx = topic_model._outliers + t_id
+        if idx < len(topic_model.topic_embeddings_):
+            t_embeds.append(topic_model.topic_embeddings_[idx])
+            t_labels.append(f"T{t_id}: " + "_".join([w[0] for w in topic_model.get_topic(t_id)[:3]]))
+    
+    if len(t_embeds) > 1:
+        sim_matrix = cosine_similarity(t_embeds)
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(sim_matrix, xticklabels=t_labels, yticklabels=t_labels, cmap='mako_r', annot=True, fmt=".2f", vmin=0, vmax=1)
+        plt.title('BERTopic 簇间语义相似度矩阵 (Cosine Similarity)', fontweight='bold')
+        plt.xticks(rotation=45, ha='right', fontsize=10)
+        plt.yticks(rotation=0, fontsize=10)
+        plt.tight_layout()
+        plt.savefig(os.path.join(RESULTS_DIR, 'bertopic_similarity_heatmap.png'), dpi=300, bbox_inches='tight')
+        plt.close()
 
-    try:
-        fig_barchart = topic_model.visualize_barchart(top_n_topics=min(10, n_topics), n_words=10)
-        barchart_path = os.path.join(OUTPUT_DIR, 'bertopic_barchart.html')
-        fig_barchart.write_html(barchart_path)
-        print(f"  ✓ 关键词柱状图已保存：{barchart_path}")
-    except Exception as e:
-        print(f"  ⚠ 关键词柱状图生成失败：{e}")
-
-    # ========================================================================
-    # 第四部分：模型对比与结果导出
-    # ========================================================================
-    print("\n" + "─" * 50)
-    print("📝 第四部分：模型对比与结果导出")
-    print("─" * 50)
-
-    print("\n[4.1] LDA 与 BERTopic 模型对比摘要：")
-    print(f"\n  {'指标':<25} {'LDA':>15} {'BERTopic':>15}")
-    print(f"  {'─'*55}")
-    print(f"  {'识别主题数':<25} {best_k:>15} {n_topics:>15}")
-    print(f"  {'一致性得分(c_v)':<24} {best_score:>15.4f} {'N/A':>15}")
-    print(f"  {'离群点/未分类文档数':<22} {'0':>15} {bertopic_outliers:>15}")
-    print(f"  {'方法论基础':<25} {'词袋+概率生成':>15} {'语义嵌入+密度聚类':>15}")
-
-    # 4.2 关联 BERTopic 话题标签
-    print("\n[4.2] 关联 BERTopic 话题标签到原始数据...")
-
+    # ---------------- 4. 注意力扩散热度映射分析 ----------------
+    print("\n[4] 生成 扩散热度 (注意力强度) 与话题关联分析...")
+    # 组装数据
     topic_label_map = {}
-    for topic_id in set(topics):
-        if topic_id == -1:
-            topic_label_map[topic_id] = "离群点（未分类）"
+    for t_id in set(topics):
+        if t_id == -1:
+            topic_label_map[t_id] = "Outliers"
         else:
-            try:
-                top_words = topic_model.get_topic(topic_id)
-                if top_words:
-                    label = "_".join([w for w, _ in top_words[:3]])
-                    topic_label_map[topic_id] = f"Topic{topic_id}_{label}"
-                else:
-                    topic_label_map[topic_id] = f"Topic_{topic_id}"
-            except Exception:
-                topic_label_map[topic_id] = f"Topic_{topic_id}"
+            top_words = topic_model.get_topic(t_id)
+            label = "_".join([w for w, _ in top_words[:3]])
+            topic_label_map[t_id] = f"T{t_id}_{label}"
 
-    df_clean['bertopic_topic_id'] = topics
-    df_clean['topic_label'] = df_clean['bertopic_topic_id'].map(topic_label_map)
+    df_clean['topic_id'] = topics
+    df_clean['topic_label'] = df_clean['topic_id'].map(topic_label_map)
+    df_export = df_clean.copy()
+    
+    # 过滤掉离群点进行热度统计
+    df_valid = df_export[df_export['topic_id'] != -1]
+    
+    # 图 7: 话题 vs 点赞中位数 Barplot
+    plt.figure(figsize=(10, 6))
+    # We use median or mean with bootstrapping (sns does mean by default with 95% CI)
+    # Using barplot shows the average attention intensity per topic
+    sns.barplot(data=df_valid, y='topic_label', x='like_count', palette=COLOR_PALETTE, errorbar=('ci', 95), capsize=.1)
+    plt.title('语义主题扩散热度分析 (注意力吸附效应)', fontweight='bold', fontsize=14)
+    plt.xlabel('单条评论平均点赞数 (含 95% 置信区间误差棒)')
+    plt.ylabel('深度学习子话题')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, 'topic_attention_diffusion.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
-    # 4.3 导出
-    print("\n[4.3] 导出带有话题标签的最终数据...")
-
-    export_columns = [
-        'comment_id', 'aweme_id', 'content', 'create_time', 'user_id',
-        'like_count', 'sub_comment_count', 'ip_location', '所属地区',
-        'bertopic_topic_id', 'topic_label'
-    ]
-    export_cols_available = [c for c in export_columns if c in df_clean.columns]
-    df_export = df_clean[export_cols_available].copy()
     df_export.to_csv(OUTPUT_CSV, index=False, encoding='utf-8-sig')
 
-    print(f"  ✓ 已保存：{OUTPUT_CSV}")
-    print(f"  ✓ 数据行数：{len(df_export)}")
-    print(f"  ✓ topic_label 缺失值数量：{df_export['topic_label'].isna().sum()}")
-
-    # 4.4 话题分布统计
-    print("\n[4.4] 话题分布统计：")
-    topic_dist = df_export['topic_label'].value_counts()
-    print(f"\n  {'话题标签':<45} {'文档数':>8} {'占比':>8}")
-    print(f"  {'─'*63}")
-    for label, count in topic_dist.items():
-        pct = count / len(df_export) * 100
-        print(f"  {label:<45} {count:>8} {pct:>7.1f}%")
-
-    # ========================================================================
-    # 第五部分：LDA 话题分配（补充）
-    # ========================================================================
     print("\n" + "─" * 50)
-    print("📎 第五部分：LDA 话题分配结果（补充）")
+    print("📋 模型对比摘要总结：")
+    print(f"  {'指标':<25} {'LDA':>15} {'BERTopic':>15}")
+    print(f"  {'─'*55}")
+    print(f"  {'最优主题数(Clusters)':<25} {best_k:>15} {n_topics:>15}")
+    print(f"  {'一致性得分(C_v)':<27} {best_score:>15.4f} {bertopic_cv_score:>15.4f}")
+    print(f"  {'离群点文档占比':<26} {'0%':>15} {((len(df_clean)-len(df_valid))/len(df_clean)*100):>14.1f}%")
+    print(f"  {'方法论底层':<25} {'概率生成':>15} {'语义嵌入映射':>15}")
     print("─" * 50)
-
-    print("\n[5.1] 为每篇文档分配 LDA 主导话题...")
-    lda_topic_assignments = []
-    for bow in corpus:
-        topic_probs = best_lda.get_document_topics(bow, minimum_probability=0.0)
-        dominant_topic = max(topic_probs, key=lambda x: x[1])[0]
-        lda_topic_assignments.append(dominant_topic)
-
-    df_clean['lda_topic_id'] = lda_topic_assignments
-
-    lda_topic_dist = df_clean['lda_topic_id'].value_counts().sort_index()
-    print(f"\n  LDA 话题分布统计（K={best_k}）：")
-    for topic_id, count in lda_topic_dist.items():
-        pct = count / len(df_clean) * 100
-        words = best_lda.show_topic(topic_id, topn=5)
-        word_str = ', '.join([w for w, _ in words])
-        print(f"    话题 {topic_id} ({word_str}): {count} 条 ({pct:.1f}%)")
-
-    # ========================================================================
-    # 最终报告
-    # ========================================================================
-    print("\n" + "=" * 70)
-    print("  ✅ 维度二分析完成！")
-    print("=" * 70)
-    print(f"""
-  📁 生成文件清单：
-  ├── {os.path.relpath(coherence_fig_path, BASE_DIR)}
-  ├── {os.path.relpath(os.path.join(OUTPUT_DIR, 'lda_visualization.html'), BASE_DIR)}
-  ├── {os.path.relpath(os.path.join(OUTPUT_DIR, 'bertopic_topics.html'), BASE_DIR)}
-  ├── {os.path.relpath(os.path.join(OUTPUT_DIR, 'bertopic_barchart.html'), BASE_DIR)}
-  └── {os.path.relpath(OUTPUT_CSV, BASE_DIR)}
-
-  🔬 关键发现：
-  • LDA 最优话题数 K = {best_k}（c_v = {best_score:.4f}）
-  • BERTopic 自动识别 {n_topics} 个主题
-  • 离群点文档占比：{bertopic_outliers/len(df_clean)*100:.1f}%
-
-  📌 后续用途：
-  • douyin_data_with_topics.csv 中的 topic_label 列将用于：
-    - 维度三：按子话题计算注意力半衰期
-    - 维度四：探究子话题类别与老化速度的 Spearman 相关性
-""")
-
+    
+    print("\n✅ 所有静态高清组图与数据输出均已完成！落盘于 results/dimension2/")
 
 if __name__ == '__main__':
     main()
