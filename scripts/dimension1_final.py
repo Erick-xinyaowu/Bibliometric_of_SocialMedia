@@ -76,7 +76,7 @@ def plot_lorenz_curve(values, title, save_path):
 print("[1/2] Processing Text Semantic (Zipf's Law)...")
 all_words = []
 for text in df['content']:
-    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'[^\w\s]', '', text).upper()
     words = jieba.lcut(text)
     words = [w.strip() for w in words if w.strip() not in stopwords and len(w.strip()) > 1]
     all_words.extend(words)
@@ -118,9 +118,12 @@ plt.close()
 
 # 1.3 Word Cloud
 word_dict = dict(zip(word_counts['word'], word_counts['frequency']))
-# Swap to magma for beautiful academic contrast
+# Option D: Tech Blue-Purple gradient (AI/Computer Theme)
+from matplotlib.colors import ListedColormap
+custom_cmap = ListedColormap(['#1F1C2C', '#3A3D98', '#6A82FB', '#00C9FF'])
+
 wc = WordCloud(font_path='C:/Windows/Fonts/simhei.ttf', width=1600, height=1000, 
-               background_color='#1a1a1a', colormap='magma', max_words=200).generate_from_frequencies(word_dict)
+               background_color='white', colormap=custom_cmap, max_words=100).generate_from_frequencies(word_dict)
 plt.figure(figsize=(14, 9))
 plt.imshow(wc, interpolation='bilinear')
 plt.axis('off')
